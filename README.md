@@ -175,6 +175,7 @@ VM is a simple sandbox to synchronously run untrusted code without the `require`
 -   `wasm` - If set to `false` any attempt to compile a WebAssembly module will throw a `WebAssembly.CompileError` (default: `true`). Note: `WebAssembly.JSTag` is removed inside the sandbox for security reasons, so wasm code cannot catch JavaScript exceptions.
 -   `allowAsync` - If set to `false` any attempt to run code using `async` will throw a `VMError` (default: `true`).
 -   `bufferAllocLimit` - Maximum size in bytes for a single `Buffer.alloc` / `Buffer.allocUnsafe` / `Buffer.allocUnsafeSlow` / `Buffer(N)` / `new Buffer(N)` request from inside the sandbox. Requests that exceed this cap throw a `RangeError` synchronously without performing the host allocation. Default: `Infinity` (no cap, fully backwards-compatible). Embedders running untrusted code in memory-constrained environments (Docker / Kubernetes / Lambda / serverless) should opt into a finite cap (e.g. `32 * 1024 * 1024`) as part of layered DoS defense, the same way they opt into `timeout`. See [Hardening recommendations](#hardening-recommendations) below.
+-   `bufferAllocTotalLimit` - Maximum cumulative size in bytes of all `Buffer` / `Uint8Array` / `ArrayBuffer` / `WebAssembly.Memory` allocations a single `run()` may perform. `bufferAllocLimit` caps each individual allocation but cannot stop a script from creating many just-under-the-cap buffers that accumulate into unbounded host memory; this budget closes that gap. Every sandbox-facing allocation path charges one shared ledger, the ledger resets on each `run()`, and exceeding it throws a `RangeError` synchronously without performing the host allocation. Default: `Infinity` (no budget, fully backwards-compatible).
 
 **IMPORTANT**: Timeout is only effective on synchronous code that you run through `run`. Timeout does **NOT** work on any method returned by VM. There are some situations when timeout doesn't work - see [#244](https://github.com/patriksimek/vm2/pull/244).
 
@@ -210,6 +211,7 @@ Unlike `VM`, `NodeVM` allows you to require modules in the same way that you wou
 -   `eval` - If set to `false` any calls to `eval` or function constructors (`Function`, `GeneratorFunction`, etc.) will throw an `EvalError` (default: `true`).
 -   `wasm` - If set to `false` any attempt to compile a WebAssembly module will throw a `WebAssembly.CompileError` (default: `true`). Note: `WebAssembly.JSTag` is removed inside the sandbox for security reasons, so wasm code cannot catch JavaScript exceptions.
 -   `bufferAllocLimit` - Same semantics as on `VM` — maximum size in bytes for a single `Buffer.alloc` family request from inside the sandbox. Default: `Infinity`. See [Hardening recommendations](#hardening-recommendations).
+-   `bufferAllocTotalLimit` - Same semantics as on `VM` — maximum cumulative bytes of `Buffer` / typed-array allocations a single `run()` may perform. Default: `Infinity`. See [Hardening recommendations](#hardening-recommendations).
 -   `sourceExtensions` - Array of file extensions to treat as source code (default: `['js']`).
 -   `require` - `true`, an object or a Resolver to enable `require` method (default: `false`).
 -   `require.external` - Values can be `true`, an array of allowed external modules, or an object (default: `false`). All paths matching `/node_modules/${any_allowed_external_module}/(?!/node_modules/)` are allowed to be required.
@@ -531,7 +533,18 @@ const vm = new VM({
 });
 ```
 
-The cap also applies to the deprecated `Buffer(N)` and `new Buffer(N)` paths. Note that aggregate exhaustion (many small allocations, `Buffer.concat`, `Uint8Array`, `String.repeat`, `Array(n).fill()`, etc.) is **not** covered by this cap — combine with a host-side memory limit (`--max-old-space-size`, container limit, cgroup) for full coverage.
+The cap also applies to the deprecated `Buffer(N)` and `new Buffer(N)` paths. To also bound aggregate exhaustion from many individually-legal allocations (`Buffer.alloc` in a loop, `Buffer.concat`, `Uint8Array`, `ArrayBuffer`, `WebAssembly.Memory`), add `bufferAllocTotalLimit` — a cumulative per-`run()` byte budget shared by every sandbox allocation path, reset on each `run()`:
+
+```js
+const vm = new VM({
+	timeout: 1000,
+	bufferAllocLimit: 32 * 1024 * 1024,
+	bufferAllocTotalLimit: 64 * 1024 * 1024,
+	allowAsync: false,
+});
+```
+
+Note that non-buffer exhaustion (`String.repeat`, `Array(n).fill()`, etc.) is **not** covered by either cap — combine with a host-side memory limit (`--max-old-space-size`, container limit, cgroup) for full coverage.
 
 ### 2. Install a host-side `unhandledRejection` handler
 
@@ -566,7 +579,7 @@ A scoped fix may ship behind an opt-in `swallowSandboxUnhandledRejections` flag 
 
 ### 3. Run with a process-level memory cap
 
-Even with `bufferAllocLimit` set, run the host process with `--max-old-space-size` (or an equivalent container memory limit) sized for the workload. The cap protects against the single-allocation primitive; the OS-level limit protects against aggregate exhaustion and against any future allocation primitive vm2 hasn't yet capped.
+Even with `bufferAllocLimit` and `bufferAllocTotalLimit` set, run the host process with `--max-old-space-size` (or an equivalent container memory limit) sized for the workload. The caps protect against single-shot and cumulative buffer allocation; the OS-level limit protects against non-buffer exhaustion (strings, arrays, objects) and against any future allocation primitive vm2 hasn't yet capped.
 
 ### 4. Treat `require.builtin: ['*']` as a non-sandbox configuration
 
